@@ -18,19 +18,23 @@ Published on npm as [`@modelcontextprotocol/server-filesystem`](https://www.npmj
 The server uses a flexible directory access control system. Directories can be specified via command-line arguments or dynamically via [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots).
 
 ### Method 1: Command-line Arguments
+
 Specify Allowed directories when starting the server:
+
 ```bash
 mcp-server-filesystem /path/to/dir1 /path/to/dir2
 ```
 
-### Method 2: MCP Roots (Recommended)
-MCP clients that support [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots) can dynamically update the Allowed directories. 
+### Method 2: MCP Roots
 
-Roots notified by Client to Server, completely replace any server-side Allowed directories when provided.
+MCP clients that support [Roots](https://modelcontextprotocol.io/docs/learn/client-concepts#roots) can dynamically narrow the allowed directories at runtime.
 
-**Important**: If server starts without command-line arguments AND client doesn't support roots protocol, the server fails at initialization: it logs the reason to stderr, closes the connection and exits with status 1. A client that supports roots but provides none (or none that are valid) keeps the connection, with no allowed directories until it sends `roots/list_changed` with valid roots.
+How roots interact with the allowed directories depends on how the server was started:
 
-This is the recommended method, as this enables runtime directory updates via `roots/list_changed` notifications without server restart, providing a more flexible and modern integration experience.
+- **Started with command-line directories**: the command-line directories are the floor. Roots that fall within them narrow the allowed directories for the session (a client focused on one subdirectory scopes the server to it); roots outside them are ignored, and no roots answer, however empty, revokes or expands past the operator's directories. The [specification](https://modelcontextprotocol.io/docs/learn/client-concepts#roots) defines roots as advisory coordination ("SHOULD respect", not "MUST enforce"), so the command line remains the authoritative boundary.
+- **Started without command-line directories**: the client's roots define the allowed directories, and updates replace them, since they are the only scope the server has.
+
+**Important**: If server starts without command-line arguments AND client doesn't support roots protocol, the server fails at initialization: it logs the reason to stderr, closes the connection and exits with status 1. A client that supports roots but provides none (or none that are valid) keeps the connection, with the command-line directories when any were given, and with no allowed directories otherwise, until it sends `roots/list_changed` with valid roots.
 
 ### How It Works
 
@@ -43,16 +47,16 @@ The server's directory access control follows this flow:
 2. **Client Connection & Initialization**
    - Client connects and sends `initialize` request with capabilities
    - Server checks if client supports roots protocol (`capabilities.roots`)
-   
+
 3. **Roots Protocol Handling** (if client supports roots)
    - **On initialization**: Server requests roots from client via `roots/list`
    - Client responds with its configured roots
-   - Server replaces ALL allowed directories with client's roots
-   - Tool calls that arrive before the initial roots are loaded wait for them, so they are checked against the client's roots
+   - With command-line directories present, the server narrows the allowed directories to the roots within them and ignores the rest; without any, the client's roots become the allowed directories
+   - Tool calls that arrive before the initial roots are loaded wait for them, so they are checked against the resulting directories
    - **On runtime updates**: Client can send `notifications/roots/list_changed`
-   - Server requests updated roots and replaces allowed directories again
+   - Server requests updated roots and re-derives the allowed directories the same way
    - Tool calls that arrive while an update is being fetched wait for it, so none runs against a root the client has just withdrawn
-   - Once the client's roots are in force, an update with no valid roots revokes access: every path is refused ("Access denied - no allowed directories") until the client exposes a root again. Before any root has been in force, such an update keeps the command-line directories
+   - Started without command-line directories, once the client's roots are in force, an update with no valid roots revokes access: every path is refused ("Access denied - no allowed directories") until the client exposes a root again. With command-line directories, such an update restores them in full
 
 4. **Fallback Behavior** (if client doesn't support roots)
    - Server continues using command-line directories only
@@ -65,8 +69,6 @@ The server's directory access control follows this flow:
    - Server requires at least ONE allowed directory to operate
 
 **Note**: The server will only allow operations within directories specified either via `args` or via Roots.
-
-
 
 ## API
 
@@ -170,7 +172,7 @@ The server's directory access control follows this flow:
         - Empty array for empty directories
         - Omitted for files
   - Output is formatted with 2-space indentation for readability
-    
+
 - **get_file_info**
   - Get detailed file/directory metadata
   - Input: `path` (string)
@@ -200,30 +202,32 @@ on each tool so clients can:
 
 The mapping for filesystem tools is:
 
-| Tool                        | readOnlyHint | idempotentHint | destructiveHint | Notes                                            |
-|-----------------------------|--------------|----------------|-----------------|--------------------------------------------------|
-| `read_text_file`            | `true`       | –              | –               | Pure read                                       |
-| `read_media_file`           | `true`       | –              | –               | Pure read                                       |
-| `read_multiple_files`       | `true`       | –              | –               | Pure read                                       |
-| `list_directory`            | `true`       | –              | –               | Pure read                                       |
-| `list_directory_with_sizes` | `true`       | –              | –               | Pure read                                       |
-| `directory_tree`            | `true`       | –              | –               | Pure read                                       |
-| `search_files`              | `true`       | –              | –               | Pure read                                       |
-| `get_file_info`             | `true`       | –              | –               | Pure read                                       |
-| `list_allowed_directories`  | `true`       | –              | –               | Pure read                                       |
-| `create_directory`          | `false`      | `true`         | `false`         | Re‑creating the same dir is a no‑op             |
-| `write_file`                | `false`      | `true`         | `true`          | Overwrites existing files                       |
-| `edit_file`                 | `false`      | `false`        | `true`          | Re‑applying edits can fail or double‑apply      |
-| `move_file`                 | `false`      | `false`        | `true`          | Deletes source file                             |
+| Tool                        | readOnlyHint | idempotentHint | destructiveHint | Notes                                      |
+| --------------------------- | ------------ | -------------- | --------------- | ------------------------------------------ |
+| `read_text_file`            | `true`       | –              | –               | Pure read                                  |
+| `read_media_file`           | `true`       | –              | –               | Pure read                                  |
+| `read_multiple_files`       | `true`       | –              | –               | Pure read                                  |
+| `list_directory`            | `true`       | –              | –               | Pure read                                  |
+| `list_directory_with_sizes` | `true`       | –              | –               | Pure read                                  |
+| `directory_tree`            | `true`       | –              | –               | Pure read                                  |
+| `search_files`              | `true`       | –              | –               | Pure read                                  |
+| `get_file_info`             | `true`       | –              | –               | Pure read                                  |
+| `list_allowed_directories`  | `true`       | –              | –               | Pure read                                  |
+| `create_directory`          | `false`      | `true`         | `false`         | Re‑creating the same dir is a no‑op        |
+| `write_file`                | `false`      | `true`         | `true`          | Overwrites existing files                  |
+| `edit_file`                 | `false`      | `false`        | `true`          | Re‑applying edits can fail or double‑apply |
+| `move_file`                 | `false`      | `false`        | `true`          | Deletes source file                        |
 
 > Note: `idempotentHint` and `destructiveHint` are meaningful only when `readOnlyHint` is `false`, as defined by the MCP spec. Every tool also sets `openWorldHint: false` — this server only accesses the local filesystem within its allowed directories, never an open or external world.
 
 ## Usage with Claude Desktop
+
 Add this to your `claude_desktop_config.json`:
 
 Note: you can provide sandboxed directories to the server by mounting them to `/projects`. Adding the `ro` flag will make the directory readonly by the server.
 
 ### Docker
+
 Note: all directories must be mounted to `/projects` by default.
 
 ```json
@@ -235,9 +239,12 @@ Note: all directories must be mounted to `/projects` by default.
         "run",
         "-i",
         "--rm",
-        "--mount", "type=bind,src=/Users/username/Desktop,dst=/projects/Desktop",
-        "--mount", "type=bind,src=/path/to/other/allowed/dir,dst=/projects/other/allowed/dir,ro",
-        "--mount", "type=bind,src=/path/to/file.txt,dst=/projects/path/to/file.txt",
+        "--mount",
+        "type=bind,src=/Users/username/Desktop,dst=/projects/Desktop",
+        "--mount",
+        "type=bind,src=/path/to/other/allowed/dir,dst=/projects/other/allowed/dir,ro",
+        "--mount",
+        "type=bind,src=/path/to/file.txt,dst=/projects/path/to/file.txt",
         "mcp/filesystem",
         "/projects"
       ]
@@ -305,7 +312,8 @@ Alternatively, you can add the configuration to a file called `.vscode/mcp.json`
 You can provide sandboxed directories to the server by mounting them to `/projects`. Adding the `ro` flag will make the directory readonly by the server.
 
 ### Docker
-Note: all directories must be mounted to `/projects` by default. 
+
+Note: all directories must be mounted to `/projects` by default.
 
 ```json
 {
@@ -316,7 +324,8 @@ Note: all directories must be mounted to `/projects` by default.
         "run",
         "-i",
         "--rm",
-        "--mount", "type=bind,src=${workspaceFolder},dst=/projects/workspace",
+        "--mount",
+        "type=bind,src=${workspaceFolder},dst=/projects/workspace",
         "mcp/filesystem",
         "/projects"
       ]

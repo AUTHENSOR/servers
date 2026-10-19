@@ -1,10 +1,12 @@
-// Roots handling as a client sees it (#4854): how the client's roots replace
-// the command-line directories after initialize, how roots/list_changed
-// updates them, and what happens when roots are invalid, fail or are not
-// offered. Driven by a real Client that answers the server's roots/list
-// requests over the in-memory transport. Guards the fixes for #3204 (tool
-// calls wait for the initial roots) and #4992 (no directories at all fails
-// visibly), and pins #3602's roots-replace-the-command-line behavior as the README documents it.
+// Roots handling as a client sees it (#4854): how the client's roots update
+// the allowed directories after initialize, how roots/list_changed updates
+// them, and what happens when roots are invalid, fail or are not offered.
+// Driven by a real Client that answers the server's roots/list requests over
+// the in-memory transport. Guards the fixes for #3204 (tool calls wait for
+// the initial roots) and #4992 (no directories at all fails visibly), and
+// pins the #3602 semantics: command-line directories are the floor that the
+// client's roots narrow but never replace, and only a server started without
+// them takes its whole scope from roots.
 
 import fs from "fs/promises";
 import path from "path";
@@ -55,21 +57,24 @@ afterEach(async () => {
 });
 
 describe("initial roots", () => {
-  // #3602: the client's roots replace the command-line directories rather
-  // than being added to them, as the README documents.
-  it("replace the command-line directories with the client's roots (#3602)", async () => {
+  // #3602: roots that fall outside the command-line directories are
+  // ignored; the operator's directories stay in force.
+  it("keep the command-line directories when every root falls outside them (#3602)", async () => {
     const { client } = await connectTracked([cliDir], {
       capabilities: ROOTS,
       listRoots: () => [rootOf(rootDir)],
     });
-    await vi.waitFor(async () =>
-      expect(await allowedDirectoriesOf(client)).toEqual([rootDir]),
+    await vi.waitFor(() =>
+      expect(stderr).toHaveBeenCalledWith(
+        "All client roots fall outside the command-line allowed directories; keeping the command-line directories",
+      ),
     );
-    expect(stderr).toHaveBeenCalledWith(
-      "Updated allowed directories from MCP roots: 1 valid directories",
+    expect(await allowedDirectoriesOf(client)).toEqual([cliDir]);
+    const denied = await call(client, "list_directory", { path: rootDir });
+    expect(textOf(denied)).toMatch(/^Access denied/);
+    expect(textOf(await call(client, "list_allowed_directories"))).toBe(
+      `Allowed directories:\n${cliDir}`,
     );
-    const result = await call(client, "list_directory", { path: cliDir });
-    expect(textOf(result)).toMatch(/^Access denied/);
   });
 
   it("accept a pathToFileURL root with spaces and non-ASCII characters", async () => {
@@ -97,17 +102,19 @@ describe("initial roots", () => {
   });
 
   it("drop invalid roots and keep the valid ones", async () => {
+    const sub = path.join(cliDir, "sub");
+    await fs.mkdir(sub);
     await fs.writeFile(path.join(cliDir, "file.txt"), "");
     const { client } = await connectTracked([cliDir], {
       capabilities: ROOTS,
       listRoots: () => [
         rootOf(path.join(cliDir, "missing")),
         rootOf(path.join(cliDir, "file.txt")),
-        rootOf(rootDir),
+        rootOf(sub),
       ],
     });
     await vi.waitFor(async () =>
-      expect(await allowedDirectoriesOf(client)).toEqual([rootDir]),
+      expect(await allowedDirectoriesOf(client)).toEqual([sub]),
     );
     expect(stderr).toHaveBeenCalledWith(
       `Skipping invalid path or inaccessible: ${pathToFileURL(path.join(cliDir, "missing")).href}`,
@@ -124,7 +131,7 @@ describe("initial roots", () => {
     });
     await vi.waitFor(() =>
       expect(stderr).toHaveBeenCalledWith(
-        "No valid root directories provided by client",
+        "No usable client roots; keeping the command-line directories",
       ),
     );
     expect(await allowedDirectoriesOf(client)).toEqual([cliDir]);
@@ -137,7 +144,7 @@ describe("initial roots", () => {
     });
     await vi.waitFor(() =>
       expect(stderr).toHaveBeenCalledWith(
-        "No valid root directories provided by client",
+        "No usable client roots; keeping the command-line directories",
       ),
     );
     expect(await allowedDirectoriesOf(client)).toEqual([cliDir]);
@@ -233,29 +240,121 @@ describe("initial roots", () => {
   });
 });
 
-describe("roots/list_changed", () => {
-  it("re-fetches the roots and replaces the allowed directories", async () => {
-    let roots = [rootOf(rootDir)];
+describe("command-line directories as the floor", () => {
+  it("narrow the allowed directories to a root within them", async () => {
+    const sub = path.join(cliDir, "sub");
+    await fs.mkdir(sub);
+    await fs.writeFile(path.join(sub, "f.txt"), "in sub");
+    const { client } = await connectTracked([cliDir], {
+      capabilities: ROOTS,
+      listRoots: () => [rootOf(sub)],
+    });
+    await vi.waitFor(async () =>
+      expect(await allowedDirectoriesOf(client)).toEqual([sub]),
+    );
+    expect(stderr).toHaveBeenCalledWith(
+      "Narrowed allowed directories to 1 client root(s) within the command-line directories",
+    );
+    expect(
+      textOf(
+        await call(client, "read_text_file", {
+          path: path.join(sub, "f.txt"),
+        }),
+      ),
+    ).toBe("in sub");
+    // The parent is out of scope once the root narrows it.
+    expect(
+      textOf(await call(client, "list_directory", { path: cliDir })),
+    ).toMatch(/^Access denied/);
+  });
+
+  it("keep the root within the floor and ignore the root outside it", async () => {
+    const sub = path.join(cliDir, "sub");
+    await fs.mkdir(sub);
+    const { client } = await connectTracked([cliDir], {
+      capabilities: ROOTS,
+      listRoots: () => [rootOf(sub), rootOf(rootDir)],
+    });
+    await vi.waitFor(async () =>
+      expect(await allowedDirectoriesOf(client)).toEqual([sub]),
+    );
+    expect(stderr).toHaveBeenCalledWith(
+      "Narrowed allowed directories to 1 client root(s) within the command-line directories; ignored 1 root(s) outside them",
+    );
+    expect(
+      textOf(await call(client, "list_directory", { path: rootDir })),
+    ).toMatch(/^Access denied/);
+  });
+
+  it("restore the full floor when the client withdraws its roots", async () => {
+    const sub = path.join(cliDir, "sub");
+    await fs.mkdir(sub);
+    let roots = [rootOf(sub)];
     const { client } = await connectTracked([cliDir], {
       capabilities: ROOTS,
       listRoots: () => roots,
     });
     await vi.waitFor(async () =>
-      expect(await allowedDirectoriesOf(client)).toEqual([rootDir]),
+      expect(await allowedDirectoriesOf(client)).toEqual([sub]),
     );
 
-    roots = [rootOf(cliDir), rootOf(rootDir)];
+    roots = [];
     await client.sendRootsListChanged();
     await vi.waitFor(async () =>
-      expect(await allowedDirectoriesOf(client)).toEqual([cliDir, rootDir]),
+      expect(await allowedDirectoriesOf(client)).toEqual([cliDir]),
+    );
+    expect(stderr).toHaveBeenCalledWith(
+      "No usable client roots; keeping the command-line directories",
     );
   });
 
-  // #5094: once the client's roots are in force, an update that leaves no
-  // valid root revokes access instead of keeping the previous directories.
+  it("ignore a root that resolves through a symlink out of the floor", async () => {
+    const link = path.join(cliDir, "link-out");
+    await fs.symlink(rootDir, link);
+    const { client } = await connectTracked([cliDir], {
+      capabilities: ROOTS,
+      listRoots: () => [rootOf(link)],
+    });
+    await vi.waitFor(() =>
+      expect(stderr).toHaveBeenCalledWith(
+        "All client roots fall outside the command-line allowed directories; keeping the command-line directories",
+      ),
+    );
+    expect(await allowedDirectoriesOf(client)).toEqual([cliDir]);
+    expect(
+      textOf(await call(client, "list_directory", { path: rootDir })),
+    ).toMatch(/^Access denied/);
+  });
+});
+
+describe("roots/list_changed", () => {
+  it("re-fetches the roots and updates the allowed directories", async () => {
+    const a = path.join(cliDir, "a");
+    const b = path.join(cliDir, "b");
+    await fs.mkdir(a);
+    await fs.mkdir(b);
+    let roots = [rootOf(a)];
+    const { client } = await connectTracked([cliDir], {
+      capabilities: ROOTS,
+      listRoots: () => roots,
+    });
+    await vi.waitFor(async () =>
+      expect(await allowedDirectoriesOf(client)).toEqual([a]),
+    );
+
+    roots = [rootOf(a), rootOf(b)];
+    await client.sendRootsListChanged();
+    await vi.waitFor(async () =>
+      expect(await allowedDirectoriesOf(client)).toEqual([a, b]),
+    );
+  });
+
+  // #5094: once the client's roots are in force (which requires starting
+  // without command-line directories), an update that leaves no valid root
+  // revokes access instead of keeping the previous directories.
   it("revokes access when the client withdraws its last root (#5094)", async () => {
     let roots = [rootOf(rootDir)];
-    const { client } = await connectTracked([cliDir], {
+    const { client } = await connectTracked([], {
       capabilities: ROOTS,
       listRoots: () => roots,
     });
@@ -276,10 +375,6 @@ describe("roots/list_changed", () => {
     expect(textOf(result)).toMatch(
       /^Access denied - no allowed directories: the client exposes no valid roots/,
     );
-    // The command-line directories do not come back either.
-    expect(
-      textOf(await call(client, "list_directory", { path: cliDir })),
-    ).toMatch(/^Access denied/);
   });
 
   it("revokes access when every remaining root is invalid (#5094)", async () => {
@@ -329,7 +424,7 @@ describe("roots/list_changed", () => {
     });
     await vi.waitFor(() =>
       expect(stderr).toHaveBeenCalledWith(
-        "No valid root directories provided by client",
+        "No usable client roots; keeping the command-line directories",
       ),
     );
 
@@ -338,7 +433,9 @@ describe("roots/list_changed", () => {
     await vi.waitFor(() =>
       expect(
         stderr.mock.calls.filter(
-          (c) => c[0] === "No valid root directories provided by client",
+          (c) =>
+            c[0] ===
+            "No usable client roots; keeping the command-line directories",
         ),
       ).toHaveLength(2),
     );
@@ -420,6 +517,8 @@ describe("roots/list_changed", () => {
   // #5097: a call waiting for the initial roots must not be released by the
   // stale initial answer; it waits for the update that overtook it.
   it("holds waiting tool calls until the update that overtook the initial load applies (#5097)", async () => {
+    const sub = path.join(cliDir, "sub");
+    await fs.mkdir(sub);
     let calls = 0;
     let releaseInitial!: () => void;
     let releaseUpdate!: () => void;
@@ -434,7 +533,7 @@ describe("roots/list_changed", () => {
       listRoots: async () => {
         calls += 1;
         await (calls === 1 ? initialHeld : updateHeld);
-        return [rootOf(rootDir)];
+        return [rootOf(sub)];
       },
     });
     await vi.waitFor(() => expect(calls).toBe(1));
@@ -461,7 +560,7 @@ describe("roots/list_changed", () => {
 
     releaseUpdate();
     expect(textOf(await pending)).toMatch(/^Access denied/);
-    expect(await allowedDirectoriesOf(client)).toEqual([rootDir]);
+    expect(await allowedDirectoriesOf(client)).toEqual([sub]);
   });
 
   it("releases waiting tool calls when the update that overtook the initial load fails (#5097)", async () => {

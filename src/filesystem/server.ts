@@ -17,6 +17,7 @@ import { pathToFileURL } from "url";
 import { z } from "zod";
 import { minimatch } from "minimatch";
 import { getValidRootDirectories } from "./roots-utils.js";
+import { isPathWithinAllowedDirectories } from "./path-validation.js";
 import {
   formatSize,
   validatePath,
@@ -164,14 +165,26 @@ export interface ServerOptions {
 
 /**
  * Build a filesystem server that may touch only `initialAllowedDirectories`
- * (already resolved and normalized by the caller) until the client's Roots
- * replace them.
+ * (already resolved and normalized by the caller). When any were given, they
+ * are the operator's floor: the client's Roots may narrow the allowed
+ * directories to roots within them, but cannot replace them, expand beyond
+ * them, or revoke them. Roots are advisory per the specification (it asks
+ * servers to "SHOULD respect" root boundaries, not enforce them) and are
+ * deprecated as of protocol version 2026-07-28 in favor of server
+ * configuration, which is what these directories are. Only a server started
+ * with no directories takes its entire scope from the client's Roots, as
+ * before (#3602).
  */
 export function createServer(
   initialAllowedDirectories: string[],
   options: ServerOptions = {},
 ): McpServer {
   let allowedDirectories = [...initialAllowedDirectories];
+  // The directories the operator named at startup, kept unchanged for the
+  // lifetime of the server. While any are present they are the floor the
+  // client's Roots narrow but never replace: every roots answer is filtered
+  // against this set, and an answer with no root inside it restores it.
+  const cliAllowedDirectories = [...initialAllowedDirectories];
   // True once the client's roots have replaced the command-line directories.
   // From then on a roots update replaces them even with none, so a client that
   // withdraws its roots withdraws the server's access too (#5094). Until then an
@@ -785,8 +798,14 @@ export function createServer(
     },
   );
 
-  // Updates allowed directories based on MCP client roots, unless a newer
-  // refresh started after this one's `generation` was taken (#5097).
+  // Updates the allowed directories from MCP client roots, unless a newer
+  // refresh started after this one's `generation` was taken (#5097). With
+  // command-line directories present, they are the floor: the client's roots
+  // narrow the allowed directories to whichever of them fall within the
+  // command-line set, roots outside it are ignored, and no answer revokes or
+  // expands past the operator's directories. Without command-line
+  // directories, the client's roots define the scope as before, including
+  // the withdrawal semantics of #5094.
   async function updateAllowedDirectoriesFromRoots(
     requestedRoots: Root[],
     generation: number,
@@ -798,7 +817,29 @@ export function createServer(
       );
       return;
     }
-    if (validatedRootDirs.length > 0) {
+    if (cliAllowedDirectories.length > 0) {
+      const rootsWithinCliDirectories = validatedRootDirs.filter((root) =>
+        isPathWithinAllowedDirectories(root, cliAllowedDirectories),
+      );
+      const ignoredCount =
+        validatedRootDirs.length - rootsWithinCliDirectories.length;
+      if (rootsWithinCliDirectories.length > 0) {
+        allowedDirectories = [...rootsWithinCliDirectories];
+        console.error(
+          `Narrowed allowed directories to ${rootsWithinCliDirectories.length} client root(s) within the command-line directories` +
+            (ignoredCount > 0
+              ? `; ignored ${ignoredCount} root(s) outside them`
+              : ""),
+        );
+      } else {
+        allowedDirectories = [...cliAllowedDirectories];
+        console.error(
+          ignoredCount > 0
+            ? "All client roots fall outside the command-line allowed directories; keeping the command-line directories"
+            : "No usable client roots; keeping the command-line directories",
+        );
+      }
+    } else if (validatedRootDirs.length > 0) {
       allowedDirectories = [...validatedRootDirs];
       rootsInForce = true;
       console.error(
@@ -814,7 +855,10 @@ export function createServer(
     }
   }
 
-  // Handles dynamic roots updates during runtime, when client sends "roots/list_changed" notification, server fetches the updated roots and replaces all allowed directories with the new roots.
+  // Handles dynamic roots updates during runtime: when the client sends a
+  // "roots/list_changed" notification, the server fetches the updated roots
+  // and re-derives the allowed directories from them (narrowed to them when
+  // command-line directories are in force).
   server.server.setNotificationHandler(
     RootsListChangedNotificationSchema,
     async () => {
